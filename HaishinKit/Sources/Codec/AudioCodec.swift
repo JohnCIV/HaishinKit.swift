@@ -67,6 +67,9 @@ final class AudioCodec {
                 let byteCount = sampleSize - ADTSHeader.size
                 buffer.packetDescriptions?.pointee = AudioStreamPacketDescription(mStartOffset: 0, mVariableFramesInPacket: 0, mDataByteSize: UInt32(byteCount))
                 buffer.packetCount = 1
+                guard byteCount > 0, byteCount <= buffer.byteCapacity else {
+                    continue
+                }
                 buffer.byteLength = UInt32(byteCount)
                 if let blockBuffer = sampleBuffer.dataBuffer {
                     CMBlockBufferCopyDataBytes(blockBuffer, atOffset: offset + ADTSHeader.size, dataLength: byteCount, destination: buffer.data)
@@ -144,7 +147,10 @@ final class AudioCodec {
             buffer?.frameLength = Self.defaultFrameCapacity
             return buffer
         default:
-            return AVAudioCompressedBuffer(format: inputFormat, packetCapacity: 1, maximumPacketSize: 1024)
+            // 16384 bytes covers any practical AAC packet size.
+            // High-bitrate AAC (e.g. 320kbps stereo) can produce ~6 KB packets;
+            // the original 1024-byte cap crashed on SRT camera audio streams.
+            return AVAudioCompressedBuffer(format: inputFormat, packetCapacity: 1, maximumPacketSize: 16384)
         }
     }
 

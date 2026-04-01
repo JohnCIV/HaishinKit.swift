@@ -3,8 +3,7 @@ import VideoToolbox
 
 extension VTDecompressionSession: VTSessionConvertible {
     static let defaultDecodeFlags: VTDecodeFrameFlags = [
-        ._EnableAsynchronousDecompression,
-        ._EnableTemporalProcessing
+        ._EnableAsynchronousDecompression
     ]
 
     @inline(__always)
