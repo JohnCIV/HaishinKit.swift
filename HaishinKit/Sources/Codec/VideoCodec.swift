@@ -79,12 +79,10 @@ final class VideoCodec {
     func makeImageBufferAttributes(_ mode: VTSessionMode) -> [NSString: AnyObject]? {
         switch mode {
         case .compression:
-            var attributes: [NSString: AnyObject] = [:]
-            if let inputFormat {
-                // Specify the pixel format of the uncompressed video.
-                attributes[kCVPixelBufferPixelFormatTypeKey] = inputFormat.mediaType.rawValue as CFNumber
-            }
-            return attributes.isEmpty ? nil : attributes
+            // Let VideoToolbox choose the best pixel format for the encoder.
+            // Previously used inputFormat.mediaType.rawValue which is 'vide' (the media
+            // type, NOT the pixel format) — caused kVTCouldNotFindVideoEncoderErr (-12710).
+            return nil
         case .decompression:
             return [
                 kCVPixelBufferIOSurfacePropertiesKey: NSDictionary(),
