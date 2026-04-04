@@ -20,7 +20,7 @@ final class VideoCodec {
     }
     var passthrough = true
     var outputStream: AsyncStream<CMSampleBuffer> {
-        AsyncStream { continuation in
+        AsyncStream(bufferingPolicy: .bufferingNewest(2)) { continuation in
             self.continuation = continuation
         }
     }

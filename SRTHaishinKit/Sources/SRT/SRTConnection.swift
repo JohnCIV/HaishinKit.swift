@@ -161,8 +161,10 @@ public actor SRTConnection: NetworkConnection {
             guard let socket else {
                 return
             }
+            // Capture stream ref once — doInput is nonisolated so no actor hop needed.
+            let stream = streams.first
             for await data in await socket.inputs {
-                await streams.first?.doInput(data)
+                stream?.doInput(data)
             }
             await close()
         }

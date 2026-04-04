@@ -1,12 +1,13 @@
 import AVFoundation
 import Foundation
 import HaishinKit
+import QuartzCore
 
 /// A class represents that reads MPEG-2 transport stream data.
 final class TSReader {
     /// An asynchronous sequence for reading data.
     public var output: AsyncStream<(UInt16, CMSampleBuffer)> {
-        AsyncStream { continuation in
+        AsyncStream(bufferingPolicy: .bufferingNewest(30)) { continuation in
             self.continuation = continuation
         }
     }
@@ -46,6 +47,10 @@ final class TSReader {
     private var formatDescriptions: [UInt16: CMFormatDescription] = [:]
     private var packetizedElementaryStreams: [UInt16: PacketizedElementaryStream] = [:]
     private var previousPresentationTimeStamps: [UInt16: CMTime] = [:]
+
+    // Diagnostics
+    private var diagVideoYieldCount: Int = 0
+    private var diagYieldLastLog: Double = 0
 
     /// Create a  new instance.
     init() {
@@ -87,6 +92,7 @@ final class TSReader {
         if packet.payloadUnitStartIndicator {
             if let sampleBuffer = makeSampleBuffer(packet.pid, forUpdate: true) {
                 continuation?.yield((packet.pid, sampleBuffer))
+                diagCountYield(sampleBuffer)
             }
             packetizedElementaryStreams[packet.pid] = PacketizedElementaryStream(packet.payload)
             return
@@ -94,6 +100,22 @@ final class TSReader {
         _ = packetizedElementaryStreams[packet.pid]?.append(packet.payload)
         if let sampleBuffer = makeSampleBuffer(packet.pid) {
             continuation?.yield((packet.pid, sampleBuffer))
+            diagCountYield(sampleBuffer)
+        }
+    }
+
+    @inline(__always)
+    private func diagCountYield(_ buffer: CMSampleBuffer) {
+        if buffer.formatDescription?.mediaType == .video {
+            diagVideoYieldCount += 1
+        }
+        let now = CACurrentMediaTime()
+        if diagYieldLastLog == 0 { diagYieldLastLog = now }
+        if now - diagYieldLastLog >= 2.0 {
+            let elapsed = now - diagYieldLastLog
+            print("[HK-DIAG] TSReader YIELD: video=\(diagVideoYieldCount) in \(elapsed)s")
+            diagVideoYieldCount = 0
+            diagYieldLastLog = now
         }
     }
 

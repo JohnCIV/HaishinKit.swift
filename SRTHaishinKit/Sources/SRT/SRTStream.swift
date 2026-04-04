@@ -20,7 +20,11 @@ public actor SRTStream {
     package var outputs: [any StreamOutput] = []
     package var bitRateStrategy: (any StreamBitRateStrategy)?
     private lazy var writer = TSWriter()
-    private lazy var reader = TSReader()
+    // nonisolated(unsafe): reader is accessed from nonisolated doInput()
+    // (called serially from SRTConnection.recv) and from actor-isolated
+    // play()/close(). Serial access is guaranteed by readerEnabled flag.
+    nonisolated(unsafe) private lazy var reader = TSReader()
+    nonisolated(unsafe) private var readerEnabled = true
     package lazy var incoming = IncomingStream(self)
     package lazy var outgoing = OutgoingStream()
     private weak var connection: SRTConnection?
@@ -115,11 +119,22 @@ public actor SRTStream {
             }
             return
         }
+        // Re-enable reader for this connection (may have been disabled by close()).
+        readerEnabled = true
+        // Capture reader output BEFORE starting recv to ensure TSReader
+        // continuation is set when doInput calls arrive.
+        let readerOutput = reader.output
+        let incomingRef = self.incoming
         await connection.recv()
-        Task {
-            await incoming.startRunning()
-            for await buffer in reader.output {
-                await incoming.append(buffer.1)
+        // Consumer runs on a detached Task (OFF the SRTStream actor)
+        // so it doesn't compete with doInput for actor scheduling time.
+        // Backlog is bounded by bufferingNewest on TSReader output (30),
+        // VideoCodec output (2), and AudioCodec output (8) — no PTS-based
+        // dropping needed here. Maximum display delay ≈ 2 decoded frames.
+        Task.detached {
+            await incomingRef.startRunning()
+            for await buffer in readerOutput {
+                await incomingRef.append(buffer.1)
             }
         }
         readyState = .playing
@@ -130,12 +145,14 @@ public actor SRTStream {
         guard readyState != .idle else {
             return
         }
+        // Disable nonisolated doInput before clearing reader state.
+        readerEnabled = false
         stopMixerInputConsumers()
         startMixerInputConsumers()
         writer.clear()
         reader.clear()
         outgoing.stopRunning()
-        Task { await incoming.stopRunning() }
+        await incoming.stopRunning()
         readyState = .idle
     }
 
@@ -147,7 +164,10 @@ public actor SRTStream {
         writer.expectedMedias = expectedMedias
     }
 
-    func doInput(_ data: Data) {
+    // nonisolated: runs on SRTConnection's context without hopping to
+    // SRTStream actor. Eliminates ~500 actor hops/sec per source.
+    nonisolated func doInput(_ data: Data) {
+        guard readerEnabled else { return }
         _ = reader.read(data)
     }
 

@@ -61,16 +61,23 @@ extension IncomingStream: AsyncRunner {
         videoCodec.startRunning()
         audioCodec.startRunning()
         isRunning = true
-        Task {
-            for await video in videoCodec.outputStream {
-                await stream?.append(video)
+        // Capture codec output streams and references while on the actor,
+        // then run consumers in detached Tasks so decoded frames don't
+        // compete with append() for IncomingStream actor scheduling time.
+        let videoOutput = videoCodec.outputStream
+        let audioOutput = audioCodec.outputStream
+        let streamRef = self.stream
+        let audioPlayerRef = self.audioPlayerNode
+        Task.detached {
+            for await video in videoOutput {
+                await streamRef?.append(video)
             }
         }
-        Task {
-            await audioPlayerNode?.startRunning()
-            for await audio in audioCodec.outputStream {
-                await audioPlayerNode?.enqueue(audio.0, when: audio.1)
-                await stream?.append(audio.0, when: audio.1)
+        Task.detached {
+            await audioPlayerRef?.startRunning()
+            for await audio in audioOutput {
+                await audioPlayerRef?.enqueue(audio.0, when: audio.1)
+                await streamRef?.append(audio.0, when: audio.1)
             }
         }
     }

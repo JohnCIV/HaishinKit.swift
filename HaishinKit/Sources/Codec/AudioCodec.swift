@@ -20,7 +20,7 @@ final class AudioCodec {
         return audioConverter?.outputFormat
     }
 
-    @AsyncStreamedFlow
+    @AsyncStreamedFlow(.bufferingNewest(8))
     var outputStream: AsyncStream<(AVAudioBuffer, AVAudioTime)>
 
     /// This instance is running to process(true) or not(false).

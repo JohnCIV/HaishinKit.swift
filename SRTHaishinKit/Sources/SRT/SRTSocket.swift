@@ -58,16 +58,30 @@ final actor SRTSocket {
     }
 
     var inputs: AsyncStream<Data> {
-        AsyncStream<Data> { continuation in
-            // If Task.detached is not used, closing will result in a deadlock.
-            Task.detached {
-                while await self.connected {
-                    let result = await self.recvmsg()
-                    if 0 <= result {
-                        continuation.yield(await self.incomingBuffer.subdata(in: 0..<Data.Index(result)))
+        // Capture socket FD and buffer size as values while on the actor.
+        let socketFD = self.socket
+        let bufSize = self.windowSizeC
+        guard socketFD != SRT_INVALID_SOCK else {
+            return AsyncStream<Data> { $0.finish() }
+        }
+        // srt_recvmsg blocks until data arrives. Running it on GCD instead of
+        // Task.detached avoids holding a cooperative-pool thread per source.
+        // With 2+ sources the cooperative pool (~4-6 threads on iPad) starves
+        // actor scheduling once audio codec Tasks kick in.
+        return AsyncStream<Data> { continuation in
+            DispatchQueue.global(qos: .userInteractive).async {
+                let buffer = UnsafeMutablePointer<CChar>.allocate(capacity: Int(bufSize))
+                defer { buffer.deallocate() }
+                while true {
+                    let result = srt_recvmsg(socketFD, buffer, bufSize)
+                    if result >= 0 {
+                        continuation.yield(Data(bytes: buffer, count: Int(result)))
                     } else {
-                        await self.stopRunning()
+                        // Socket closed or error — finish stream.
+                        // SRTConnection.recv() will call close() when the
+                        // for-await loop ends.
                         continuation.finish()
+                        break
                     }
                 }
             }
