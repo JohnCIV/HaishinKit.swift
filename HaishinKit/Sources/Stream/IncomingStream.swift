@@ -16,6 +16,13 @@ package final actor IncomingStream {
     private weak var stream: (any StreamConvertible)?
     private var audioPlayerNode: AudioPlayerNode?
 
+    /// Nonisolated delivery handlers — bypass actor re-entry for decoded frame delivery.
+    /// Set by the owning stream (e.g. RTMPStream) before startRunning() to deliver
+    /// decoded frames directly to StreamOutput objects without hopping back to the
+    /// stream actor. When nil, falls back to `await stream?.append()`.
+    nonisolated(unsafe) package var videoDeliveryHandler: (@Sendable (CMSampleBuffer) -> Void)?
+    nonisolated(unsafe) package var audioDeliveryHandler: (@Sendable (AVAudioBuffer, AVAudioTime) -> Void)?
+
     /// Creates a new instance.
     public init(_ stream: some StreamConvertible) {
         self.stream = stream
@@ -68,16 +75,30 @@ extension IncomingStream: AsyncRunner {
         let audioOutput = audioCodec.outputStream
         let streamRef = self.stream
         let audioPlayerRef = self.audioPlayerNode
+        // Capture delivery handlers — when set, decoded frames are delivered
+        // directly to StreamOutput objects without re-entering the stream actor.
+        // This eliminates the primary bottleneck where ~24 decoded frames/sec
+        // competed with ~50 RTMP message dispatches/sec for actor scheduling.
+        let videoHandler = self.videoDeliveryHandler
+        let audioHandler = self.audioDeliveryHandler
         Task.detached {
             for await video in videoOutput {
-                await streamRef?.append(video)
+                if let videoHandler {
+                    videoHandler(video)
+                } else {
+                    await streamRef?.append(video)
+                }
             }
         }
         Task.detached {
             await audioPlayerRef?.startRunning()
             for await audio in audioOutput {
                 await audioPlayerRef?.enqueue(audio.0, when: audio.1)
-                await streamRef?.append(audio.0, when: audio.1)
+                if let audioHandler {
+                    audioHandler(audio.0, audio.1)
+                } else {
+                    await streamRef?.append(audio.0, when: audio.1)
+                }
             }
         }
     }

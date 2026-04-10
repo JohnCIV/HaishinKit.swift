@@ -226,6 +226,10 @@ public actor RTMPStream {
     private var statusContinuation: AsyncStream<RTMPStatus>.Continuation?
     nonisolated(unsafe) private var mixerAudioContinuation: AsyncStream<(AVAudioPCMBuffer, AVAudioTime)>.Continuation?
     nonisolated(unsafe) private var mixerVideoContinuation: AsyncStream<CMSampleBuffer>.Continuation?
+    // Lock-protected outputs for nonisolated decoded frame delivery.
+    // Mirrors `outputs` but can be read from any thread without actor hop.
+    nonisolated(unsafe) private let _outputsLock = NSLock()
+    nonisolated(unsafe) private var _nonisolatedOutputs: [any StreamOutput] = []
     private(set) var id: UInt32 = RTMPStream.defaultID
     package lazy var incoming = IncomingStream(self)
     package lazy var outgoing = OutgoingStream()
@@ -289,6 +293,39 @@ public actor RTMPStream {
         mixerAudioContinuation?.finish()
         mixerVideoContinuation?.finish()
         outputs.removeAll()
+        _outputsLock.lock()
+        _nonisolatedOutputs.removeAll()
+        _outputsLock.unlock()
+    }
+
+    /// Copies `outputs` to the lock-protected nonisolated mirror.
+    /// Must be called from actor-isolated context whenever `outputs` changes.
+    private func syncNonisolatedOutputs() {
+        _outputsLock.lock()
+        _nonisolatedOutputs = outputs
+        _outputsLock.unlock()
+    }
+
+    /// Delivers a decoded video sample buffer directly to registered StreamOutput
+    /// objects without entering the RTMPStream actor. This eliminates the primary
+    /// bottleneck where decoded frames competed with ~50 RTMP message dispatches/sec.
+    nonisolated func deliverDecodedVideo(_ sampleBuffer: CMSampleBuffer) {
+        _outputsLock.lock()
+        let currentOutputs = _nonisolatedOutputs
+        _outputsLock.unlock()
+        for output in currentOutputs {
+            output.stream(self, didOutput: sampleBuffer)
+        }
+    }
+
+    /// Delivers a decoded audio buffer directly to registered StreamOutput objects.
+    nonisolated func deliverDecodedAudio(_ audioBuffer: AVAudioBuffer, when: AVAudioTime) {
+        _outputsLock.lock()
+        let currentOutputs = _nonisolatedOutputs
+        _outputsLock.unlock()
+        for output in currentOutputs {
+            output.stream(self, didOutput: audioBuffer, when: when)
+        }
     }
 
     /// Plays a live stream from a server.
@@ -310,6 +347,15 @@ public actor RTMPStream {
                 expectedResponse = Code.playStart
                 self.continuation = continuation
                 Task {
+                    // Set nonisolated delivery handlers so decoded frames bypass
+                    // RTMPStream actor re-entry. Must be set before startRunning()
+                    // which captures them in its detached consumer Tasks.
+                    incoming.videoDeliveryHandler = { [weak self] sampleBuffer in
+                        self?.deliverDecodedVideo(sampleBuffer)
+                    }
+                    incoming.audioDeliveryHandler = { [weak self] audioBuffer, when in
+                        self?.deliverDecodedAudio(audioBuffer, when: when)
+                    }
                     await incoming.startRunning()
                     try? await Task.sleep(nanoseconds: requestTimeout * 1_000_000)
                     self.continuation.map {
@@ -754,6 +800,22 @@ extension RTMPStream: _Stream {
             throw Error.unsupportedCodec
         }
         outgoing.videoSettings = videoSettings
+    }
+
+    // Override _Stream defaults to sync the nonisolated outputs mirror.
+    public func addOutput(_ observer: some StreamOutput) {
+        guard !outputs.contains(where: { $0 === observer }) else {
+            return
+        }
+        outputs.append(observer)
+        syncNonisolatedOutputs()
+    }
+
+    public func removeOutput(_ observer: some StreamOutput) {
+        if let index = outputs.firstIndex(where: { $0 === observer }) {
+            outputs.remove(at: index)
+            syncNonisolatedOutputs()
+        }
     }
 
     public func append(_ sampleBuffer: CMSampleBuffer) {

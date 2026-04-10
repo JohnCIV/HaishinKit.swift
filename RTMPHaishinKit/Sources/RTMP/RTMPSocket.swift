@@ -3,7 +3,11 @@ import HaishinKit
 import Network
 
 final actor RTMPSocket {
-    static let defaultWindowSizeC = Int(UInt8.max)
+    // 65536 bytes: matches typical TCP segment size. The original 255 bytes
+    // caused hundreds of NWConnection.receive() calls per video frame (~50-200KB),
+    // each going through async/await machinery. At 65536, a single frame needs
+    // only 1-3 recv() calls.
+    static let defaultWindowSizeC = 65536
 
     enum Error: Swift.Error {
         case invalidState
