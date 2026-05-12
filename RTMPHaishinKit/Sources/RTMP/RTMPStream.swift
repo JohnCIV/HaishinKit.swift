@@ -13,6 +13,12 @@ import AppKit
 typealias View = NSView
 #endif
 
+/// A data message received from the RTMP server (AMF0 type 18).
+public struct RTMPStreamDataMessage: Sendable {
+    public let handlerName: String
+    public let arguments: [(any Sendable)?]
+}
+
 /// An object that provides the interface to control a one-way channel over an RTMPConnection.
 public actor RTMPStream {
     /// The error domain code.
@@ -194,6 +200,12 @@ public actor RTMPStream {
             statusContinuation = continuation
         }
     }
+    /// The stream of RTMP data messages (AMF0 type 18) not handled internally.
+    public var dataMessages: AsyncStream<RTMPStreamDataMessage> {
+        AsyncStream { continuation in
+            dataContinuation = continuation
+        }
+    }
     /// The stream's name used for FMLE-compatible sequences.
     public private(set) var fcPublishName: String?
 
@@ -224,6 +236,7 @@ public actor RTMPStream {
     private var expectedResponse: Code?
     package var bitRateStrategy: (any StreamBitRateStrategy)?
     private var statusContinuation: AsyncStream<RTMPStatus>.Continuation?
+    private var dataContinuation: AsyncStream<RTMPStreamDataMessage>.Continuation?
     nonisolated(unsafe) private var mixerAudioContinuation: AsyncStream<(AVAudioPCMBuffer, AVAudioTime)>.Continuation?
     nonisolated(unsafe) private var mixerVideoContinuation: AsyncStream<CMSampleBuffer>.Continuation?
     private(set) var id: UInt32 = RTMPStream.defaultID
@@ -288,6 +301,7 @@ public actor RTMPStream {
     deinit {
         mixerAudioContinuation?.finish()
         mixerVideoContinuation?.finish()
+        dataContinuation?.finish()
         outputs.removeAll()
     }
 
@@ -599,7 +613,7 @@ public actor RTMPStream {
                 audioSampleAccess = message.arguments[0] as? Bool ?? true
                 videoSampleAccess = message.arguments[1] as? Bool ?? true
             default:
-                break
+                dataContinuation?.yield(RTMPStreamDataMessage(handlerName: message.handlerName, arguments: message.arguments))
             }
         case let message as RTMPUserControlMessage:
             switch message.event {
