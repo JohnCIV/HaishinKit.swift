@@ -19,7 +19,7 @@ final actor RTMPSocket {
     private var totalBytesIn = 0
     private var queueBytesOut = 0
     private var totalBytesOut = 0
-    private var parameters: NWParameters = .tcp
+    private var parameters: NWParameters = RTMPSocket.makeTCPParameters()
     private var connection: NWConnection? {
         didSet {
             oldValue?.viabilityUpdateHandler = nil
@@ -43,10 +43,29 @@ final actor RTMPSocket {
         self.qualityOfService = qualityOfService
         switch securityLevel {
         case .ssLv2, .ssLv3, .tlSv1, .negotiatedSSL:
-            parameters = .tls
+            parameters = RTMPSocket.makeTLSParameters()
         default:
-            parameters = .tcp
+            parameters = RTMPSocket.makeTCPParameters()
         }
+    }
+
+    // Disable Nagle's algorithm. Without TCP_NODELAY the kernel coalesces small
+    // audio writes that arrive after a large video write, producing ~120ms gaps
+    // between AAC packets on the wire.
+    private static func makeTCPParameters() -> NWParameters {
+        let p = NWParameters.tcp
+        if let tcp = p.defaultProtocolStack.transportProtocol as? NWProtocolTCP.Options {
+            tcp.noDelay = true
+        }
+        return p
+    }
+
+    private static func makeTLSParameters() -> NWParameters {
+        let p = NWParameters.tls
+        if let tcp = p.defaultProtocolStack.transportProtocol as? NWProtocolTCP.Options {
+            tcp.noDelay = true
+        }
+        return p
     }
 
     func connect(_ name: String, port: Int) async throws {
@@ -91,24 +110,40 @@ final actor RTMPSocket {
         outputs?.yield(data)
     }
 
+    // Concatenate all chunks from one RTMP message into a single Data and yield once.
+    // The downstream consumer awaits `connection.send(.contentProcessed)` per yielded
+    // Data; with 8KB chunkSize a single 33KB video message would otherwise produce 5
+    // sequential continuation round-trips. One large Data = one round-trip, eliminates
+    // the ~120ms audio bunching that head-of-line-blocks behind video messages.
     func send(_ iterator: AnyIterator<Data>) {
         guard connected else {
             return
         }
+        var combined = Data()
         for data in iterator {
-            queueBytesOut += data.count
-            outputs?.yield(data)
+            combined.append(data)
         }
+        guard !combined.isEmpty else { return }
+        queueBytesOut += combined.count
+        outputs?.yield(combined)
     }
 
     func send(_ chunks: [Data]) {
         guard connected else {
             return
         }
-        for data in chunks {
-            queueBytesOut += data.count
-            outputs?.yield(data)
+        guard !chunks.isEmpty else { return }
+        if chunks.count == 1 {
+            queueBytesOut += chunks[0].count
+            outputs?.yield(chunks[0])
+            return
         }
+        var combined = Data()
+        for data in chunks {
+            combined.append(data)
+        }
+        queueBytesOut += combined.count
+        outputs?.yield(combined)
     }
 
     func recv() -> AsyncStream<Data> {
