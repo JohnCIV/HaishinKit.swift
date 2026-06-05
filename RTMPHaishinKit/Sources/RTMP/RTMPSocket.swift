@@ -1,6 +1,64 @@
 import Foundation
 import HaishinKit
 import Network
+import QuartzCore
+
+/// Per-host TCP send-completion timing snapshot used by the FLS adaptive-bitrate
+/// controller. Populated on every socket send by RTMPSocket; read out-of-band via
+/// `RTMPSocket.wireStats(forHost:)`. The numbers are derived from the same kernel
+/// `connection.send(.contentProcessed)` callback that the egress CSV uses.
+public struct RTMPWireStats: Sendable {
+    public let lastUpdate: TimeInterval
+    public let rollingMeanSendDurMs: Double
+    public let rollingMaxSendDurMs: Double
+    public let queueBytesOut: Int
+    public let samples: Int
+}
+
+final class RTMPWireStatsRegistry: @unchecked Sendable {
+    static let shared = RTMPWireStatsRegistry()
+    private let lock = NSLock()
+    private struct Window {
+        var samples: [Double] = []
+        var queue: Int = 0
+        var lastUpdate: TimeInterval = 0
+    }
+    private var perHost: [String: Window] = [:]
+    private let maxSamples = 60   // ~0.75 s of video+audio messages on a 30 fps stream
+
+    func record(host: String, sendDurMs: Double, queueBytesOut: Int) {
+        guard !host.isEmpty else { return }
+        lock.lock()
+        var w = perHost[host] ?? Window()
+        w.samples.append(sendDurMs)
+        if w.samples.count > maxSamples {
+            w.samples.removeFirst(w.samples.count - maxSamples)
+        }
+        w.queue = queueBytesOut
+        w.lastUpdate = CACurrentMediaTime()
+        perHost[host] = w
+        lock.unlock()
+    }
+
+    func snapshot(host: String) -> RTMPWireStats? {
+        lock.lock()
+        defer { lock.unlock() }
+        guard let w = perHost[host], !w.samples.isEmpty else { return nil }
+        let mean = w.samples.reduce(0.0, +) / Double(w.samples.count)
+        let mx = w.samples.max() ?? 0
+        return RTMPWireStats(lastUpdate: w.lastUpdate,
+                             rollingMeanSendDurMs: mean,
+                             rollingMaxSendDurMs: mx,
+                             queueBytesOut: w.queue,
+                             samples: w.samples.count)
+    }
+
+    func reset(host: String) {
+        lock.lock()
+        perHost.removeValue(forKey: host)
+        lock.unlock()
+    }
+}
 
 final actor RTMPSocket {
     static let defaultWindowSizeC = Int(UInt8.max)
@@ -35,6 +93,20 @@ final actor RTMPSocket {
     private var qualityOfService: DispatchQoS = .userInitiated
     private var continuation: CheckedContinuation<Void, any Swift.Error>?
     private lazy var networkQueue = DispatchQueue(label: "com.haishinkit.HaishinKit.RTMPSocket.network", qos: qualityOfService)
+
+    // Wire-egress instrumentation (paired with RTMPSender's wirelog). Captures pre/post
+    // wall time around each `connection.send(.contentProcessed)` so we can distinguish
+    // "encoder bursts into outputs stream" from "TCP send buffer back-pressures us".
+    // Gated by the FLS app's `fls.streaming.wirelog.enabled` UserDefault — cached at
+    // connect time so the drain loop skips even the timestamp captures when disabled.
+    private var egressEnabled = false
+    private var egressHost: String = ""
+    private var egressLastPostWall: Double = 0
+    private var egressFirstWall: Double = 0
+    private var egressLogHandle: FileHandle?
+    private var egressLogPath: String = ""
+    private var egressLogRemaining: Int = 3600
+    private var egressSeq: Int64 = 0
 
     init() {
     }
@@ -75,6 +147,12 @@ final actor RTMPSocket {
         totalBytesIn = 0
         totalBytesOut = 0
         queueBytesOut = 0
+        egressEnabled = UserDefaults.standard.bool(forKey: "fls.streaming.wirelog.enabled")
+        egressHost = name
+        egressFirstWall = 0
+        egressLastPostWall = 0
+        egressLogRemaining = 3600
+        egressSeq = 0
         do {
             let connection = NWConnection(to: NWEndpoint.hostPort(host: .init(name), port: .init(integerLiteral: NWEndpoint.Port.IntegerLiteralType(port))), using: parameters)
             self.connection = connection
@@ -174,6 +252,43 @@ final actor RTMPSocket {
         outputs = nil
         connection = nil
         continuation = nil
+        try? egressLogHandle?.close()
+        egressLogHandle = nil
+    }
+
+    private func recordEgress(preSend: Double, postSend: Double, byteCount: Int) {
+        if egressFirstWall == 0 { egressFirstWall = preSend }
+        let sendDurMs = (postSend - preSend) * 1000
+        let intervalMs = egressLastPostWall > 0 ? (postSend - egressLastPostWall) * 1000 : 0
+        egressLastPostWall = postSend
+        guard egressLogRemaining > 0 else { return }
+        if egressLogHandle == nil {
+            let safeHost = egressHost.replacingOccurrences(of: "/", with: "_")
+                                     .replacingOccurrences(of: ":", with: "_")
+                                     .replacingOccurrences(of: " ", with: "_")
+            let stamp = ISO8601DateFormatter().string(from: Date())
+                                              .replacingOccurrences(of: ":", with: "-")
+            let docs = FileManager.default.urls(for: .documentDirectory, in: .userDomainMask)[0]
+            let dir = docs.appendingPathComponent("Telemetry", isDirectory: true)
+            try? FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+            let url = dir.appendingPathComponent("egress_\(safeHost)_\(stamp).csv")
+            FileManager.default.createFile(atPath: url.path, contents: nil)
+            egressLogHandle = try? FileHandle(forWritingTo: url)
+            egressLogPath = url.path
+            let header = "seq,wallElapsedMs,preSendMs,postSendMs,sendDurMs,intervalSincePrevPostMs,byteCount\n"
+            egressLogHandle?.write(Data(header.utf8))
+        }
+        egressSeq += 1
+        let wallElapsedMs = (postSend - egressFirstWall) * 1000
+        let preSendMs = (preSend - egressFirstWall) * 1000
+        let postSendMs = (postSend - egressFirstWall) * 1000
+        let row = "\(egressSeq),\(String(format: "%.3f", wallElapsedMs)),\(String(format: "%.3f", preSendMs)),\(String(format: "%.3f", postSendMs)),\(String(format: "%.3f", sendDurMs)),\(String(format: "%.3f", intervalMs)),\(byteCount)\n"
+        egressLogHandle?.write(Data(row.utf8))
+        egressLogRemaining -= 1
+        if egressLogRemaining == 0 {
+            try? egressLogHandle?.close()
+            egressLogHandle = nil
+        }
     }
 
     private func stateDidChange(to state: NWConnection.State) {
@@ -184,7 +299,20 @@ final actor RTMPSocket {
             let (stream, continuation) = AsyncStream<Data>.makeStream()
             Task {
                 for await data in stream where connected {
+                    // Always-on: capture send-completion timing for the ABR controller.
+                    // Two CACurrentMediaTime() calls + a registry update per RTMP message
+                    // (~78/s for a 30 fps stream) — negligible cost, drives bitrate control.
+                    let preSend = CACurrentMediaTime()
                     try await send(data)
+                    let postSend = CACurrentMediaTime()
+                    let sendDurMs = (postSend - preSend) * 1000
+                    let queueSnapshot = queueBytesOut
+                    if egressEnabled {
+                        await recordEgress(preSend: preSend, postSend: postSend, byteCount: data.count)
+                    }
+                    RTMPWireStatsRegistry.shared.record(host: egressHost,
+                                                       sendDurMs: sendDurMs,
+                                                       queueBytesOut: queueSnapshot)
                     totalBytesOut += data.count
                     queueBytesOut -= data.count
                 }
@@ -251,6 +379,19 @@ final actor RTMPSocket {
                 }
             }
         }
+    }
+}
+
+/// Public namespace exposing per-host TCP send-completion timing collected by
+/// RTMPSocket. Used by the FLS adaptive-bitrate controller. Nonisolated and
+/// lock-protected. `RTMPSocket` itself is internal to the package.
+public enum RTMPWireStatsAPI {
+    public static func snapshot(forHost host: String) -> RTMPWireStats? {
+        return RTMPWireStatsRegistry.shared.snapshot(host: host)
+    }
+
+    public static func reset(forHost host: String) {
+        RTMPWireStatsRegistry.shared.reset(host: host)
     }
 }
 
