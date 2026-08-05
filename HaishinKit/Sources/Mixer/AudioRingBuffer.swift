@@ -19,6 +19,21 @@ final class AudioRingBuffer {
     private var tail = 0
     private var skip = 0
     private var sampleTime: AVAudioFramePosition = 0
+    // Diagnostic: every nonzero `skip` memsets that many zero samples into the AAC
+    // input (silent silence insertion). The FLS sender's PTS counter is contiguous,
+    // so this should never fire in steady state — any events here are a defect.
+    // Logs the first 10 events then every 100th to avoid console spam.
+    private var skipEvents = 0
+    private var skipSamplesTotal = 0
+
+    private func recordSkip(_ samples: Int) {
+        guard 0 < samples else { return }
+        skipEvents += 1
+        skipSamplesTotal += samples
+        if skipEvents <= 10 || skipEvents % 100 == 0 {
+            logger.warn("AudioRingBuffer skip-zeros: +\(samples) samples (event #\(skipEvents), total \(skipSamplesTotal) samples ≈ \(skipSamplesTotal / 48)ms @48kHz)")
+        }
+    }
     private var inputFormat: AVAudioFormat
     private var inputBuffer: AVAudioPCMBuffer
     private var outputBuffer: AVAudioPCMBuffer
@@ -83,6 +98,7 @@ final class AudioRingBuffer {
             }
         }
         skip = max(Int(targetSampleTime - sampleTime), 0)
+        recordSkip(skip)
         sampleTime += Int64(skip)
         append(inputBuffer)
     }
@@ -99,6 +115,7 @@ final class AudioRingBuffer {
         inputBuffer.frameLength = audioPCMBuffer.frameLength
         _ = inputBuffer.copy(audioPCMBuffer)
         skip = Int(max(when.sampleTime - sampleTime, 0))
+        recordSkip(skip)
         sampleTime += Int64(skip)
         append(inputBuffer)
     }

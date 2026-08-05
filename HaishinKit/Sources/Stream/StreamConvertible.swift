@@ -29,6 +29,12 @@ public protocol StreamConvertible: Actor, MediaMixerOutput {
     /// Sets the video input buffer counts.
     func setVideoInputBufferCounts(_ videoInputBufferCounts: Int)
 
+    /// The number of video frames silently dropped by the internal AsyncStream buffer.
+    var videoInputDroppedFrames: Int { get }
+
+    /// Remaining capacity in the video input buffer (-1 if unbounded).
+    var videoInputQueueRemaining: Int { get }
+
     /// Appends a CMSampleBuffer.
     /// - Parameters:
     ///   - sampleBuffer:The sample buffer to append.
@@ -81,6 +87,14 @@ extension _Stream {
 
     public func setVideoInputBufferCounts(_ videoInputBufferCounts: Int) {
         outgoing.videoInputBufferCounts = videoInputBufferCounts
+    }
+
+    public var videoInputDroppedFrames: Int {
+        outgoing.videoInputDroppedFrames
+    }
+
+    public var videoInputQueueRemaining: Int {
+        outgoing.videoInputQueueRemaining
     }
 
     public func setSoundTransform(_ soundTransform: SoundTransform) async {

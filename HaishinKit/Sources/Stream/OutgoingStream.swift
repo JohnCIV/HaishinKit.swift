@@ -41,6 +41,12 @@ package final class OutgoingStream {
     /// Specifies the video buffering count.
     package var videoInputBufferCounts = -1
 
+    /// The number of video frames silently dropped by the AsyncStream buffer.
+    package private(set) var videoInputDroppedFrames: Int = 0
+
+    /// Remaining capacity in the video input buffer (-1 if unbounded).
+    package private(set) var videoInputQueueRemaining: Int = -1
+
     /// The asynchronous sequence for video input buffer.
     package var videoInputStream: AsyncStream<CMSampleBuffer> {
         if 0 < videoInputBufferCounts {
@@ -77,7 +83,19 @@ package final class OutgoingStream {
             audioCodec.append(sampleBuffer)
         case .video:
             videoInputFormat = sampleBuffer.formatDescription
-            videoInputContinuation?.yield(sampleBuffer)
+            if let result = videoInputContinuation?.yield(sampleBuffer) {
+                switch result {
+                case .enqueued(let remaining):
+                    videoInputQueueRemaining = remaining
+                case .dropped:
+                    videoInputDroppedFrames += 1
+                    videoInputQueueRemaining = 0
+                case .terminated:
+                    break
+                @unknown default:
+                    break
+                }
+            }
         default:
             break
         }

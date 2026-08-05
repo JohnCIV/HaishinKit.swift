@@ -62,14 +62,8 @@ extension IncomingStream: AsyncRunner {
         audioCodec.startRunning()
         isRunning = true
         Task {
-            await mediaLink.startRunning()
-            for await video in await mediaLink.dequeue {
-                await stream?.append(video)
-            }
-        }
-        Task {
             for await video in videoCodec.outputStream {
-                await mediaLink.enqueue(video)
+                await stream?.append(video)
             }
         }
         Task {

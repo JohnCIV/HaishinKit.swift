@@ -17,6 +17,14 @@ struct RTMPTimestamp<T: RTMPTimeConvertible> {
     private var updatedAt = kRTMPTimestamp_defaultTimeInterval
     private var timedeltaFraction: TimeInterval = kRTMPTimestamp_defaultTimeInterval
 
+    /// Media time elapsed on this track since its first packet, in seconds.
+    /// This is the cumulative RTMP chunk-timestamp position the remote end
+    /// aligns playback by. Returns 0 until the first packet is stamped.
+    var elapsed: TimeInterval {
+        guard startedAt != 0 else { return 0 }
+        return updatedAt - startedAt
+    }
+
     mutating func update(_ value: T) throws -> UInt32 {
         guard updatedAt < value.seconds else {
             throw Error.invalidSequence

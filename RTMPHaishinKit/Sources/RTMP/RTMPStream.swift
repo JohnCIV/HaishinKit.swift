@@ -13,6 +13,12 @@ import AppKit
 typealias View = NSView
 #endif
 
+/// A data message received from the RTMP server (AMF0 type 18).
+public struct RTMPStreamDataMessage: Sendable {
+    public let handlerName: String
+    public let arguments: [(any Sendable)?]
+}
+
 /// An object that provides the interface to control a one-way channel over an RTMPConnection.
 public actor RTMPStream {
     /// The error domain code.
@@ -194,6 +200,12 @@ public actor RTMPStream {
             statusContinuation = continuation
         }
     }
+    /// The stream of RTMP data messages (AMF0 type 18) not handled internally.
+    public var dataMessages: AsyncStream<RTMPStreamDataMessage> {
+        AsyncStream { continuation in
+            dataContinuation = continuation
+        }
+    }
     /// The stream's name used for FMLE-compatible sequences.
     public private(set) var fcPublishName: String?
 
@@ -220,10 +232,29 @@ public actor RTMPStream {
     private var dataTimestamps: [String: Date] = .init()
     private var audioTimestamp: RTMPTimestamp<AVAudioTime> = .init()
     private var videoTimestamp: RTMPTimestamp<CMTime> = .init()
+
+    /// Skew between the video and audio RTMP chunk-timestamp clocks, in seconds
+    /// (positive = video wire clock ahead of audio). The video clock advances by
+    /// the appended frames' wall-relative PTS; the audio clock advances by AAC
+    /// packet emission (AudioTime sample math). These are what the remote player
+    /// aligns by, so a magnitude that *grows* over the session is on-air AV
+    /// desync — invisible to frame-rate or queue-depth metrics. Callers should
+    /// baseline the initial value (the tracks start at slightly different
+    /// moments) and watch the delta. Returns nil until both tracks have stamped
+    /// their first packet.
+    public var avTimestampSkewSeconds: Double? {
+        let video = videoTimestamp.elapsed
+        let audio = audioTimestamp.elapsed
+        guard video > 0, audio > 0 else { return nil }
+        return video - audio
+    }
     private var requestTimeout = RTMPConnection.defaultRequestTimeout
     private var expectedResponse: Code?
     package var bitRateStrategy: (any StreamBitRateStrategy)?
     private var statusContinuation: AsyncStream<RTMPStatus>.Continuation?
+    private var dataContinuation: AsyncStream<RTMPStreamDataMessage>.Continuation?
+    private var outputJobContinuation: AsyncStream<() async -> Int>.Continuation?
+    private var outputJobTask: Task<Void, Never>?
     nonisolated(unsafe) private var mixerAudioContinuation: AsyncStream<(AVAudioPCMBuffer, AVAudioTime)>.Continuation?
     nonisolated(unsafe) private var mixerVideoContinuation: AsyncStream<CMSampleBuffer>.Continuation?
     private(set) var id: UInt32 = RTMPStream.defaultID
@@ -288,6 +319,8 @@ public actor RTMPStream {
     deinit {
         mixerAudioContinuation?.finish()
         mixerVideoContinuation?.finish()
+        dataContinuation?.finish()
+        outputJobContinuation?.finish()
         outputs.removeAll()
     }
 
@@ -554,10 +587,25 @@ public actor RTMPStream {
         try await pause(!isPaused)
     }
 
+    // FIFO forwarder to the connection. The previous "Task { await connection?.doOutput }"
+    // spawned one unstructured Task per message; Task scheduling does not guarantee
+    // creation order, so audio/video messages could arrive at the connection — and the
+    // wire — out of order under load, scrambling the delta-encoded RTMP timestamps the
+    // receiver reconstructs. Yielding into an AsyncStream preserves append order; the
+    // single consumer task forwards sequentially.
     func doOutput(_ type: RTMPChunkType, chunkStreamId: RTMPChunkStreamId, message: some RTMPMessage) {
-        Task {
-            let length = await connection?.doOutput(type, chunkStreamId: chunkStreamId, message: message) ?? 0
-            info.byteCount += length
+        if outputJobContinuation == nil {
+            let (stream, continuation) = AsyncStream<() async -> Int>.makeStream()
+            outputJobContinuation = continuation
+            outputJobTask = Task {
+                for await job in stream {
+                    info.byteCount += await job()
+                }
+            }
+        }
+        let connection = self.connection
+        outputJobContinuation?.yield {
+            await connection?.doOutput(type, chunkStreamId: chunkStreamId, message: message) ?? 0
         }
     }
 
@@ -599,7 +647,7 @@ public actor RTMPStream {
                 audioSampleAccess = message.arguments[0] as? Bool ?? true
                 videoSampleAccess = message.arguments[1] as? Bool ?? true
             default:
-                break
+                dataContinuation?.yield(RTMPStreamDataMessage(handlerName: message.handlerName, arguments: message.arguments))
             }
         case let message as RTMPUserControlMessage:
             switch message.event {

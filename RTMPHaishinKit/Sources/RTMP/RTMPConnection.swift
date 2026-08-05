@@ -196,6 +196,15 @@ public actor RTMPConnection: HaishinKit.NetworkConnection {
     }
 
     private var socket: RTMPSocket?
+    // FIFO forwarder from doOutput to the socket. doOutput previously spawned one
+    // unstructured Task per message ("Task { await socket?.send(chunks) }"); Task
+    // scheduling does not guarantee creation order, so audio/video messages could
+    // reach the socket — and the wire — out of order under load. RTMP chunk
+    // timestamps are delta-encoded per chunk stream, so wire reordering corrupts
+    // receiver-side timing. Yielding into an AsyncStream from the actor preserves
+    // call order; the single consumer task forwards sequentially.
+    private var chunkOutContinuation: AsyncStream<([Data], UInt16)>.Continuation?
+    private var chunkOutTask: Task<Void, Never>?
     private var chunks: [UInt16: RTMPChunkMessageHeader] = [:]
     private var streams: [RTMPStream] = []
     private var sequence: Int64 = 0
@@ -332,6 +341,14 @@ public actor RTMPConnection: HaishinKit.NetworkConnection {
         guard let socket, let networkMonitor else {
             throw Error.invalidState
         }
+        chunkOutContinuation?.finish()
+        let (chunkStream, chunkContinuation) = AsyncStream<([Data], UInt16)>.makeStream()
+        chunkOutContinuation = chunkContinuation
+        chunkOutTask = Task {
+            for await (chunks, csid) in chunkStream {
+                await socket.send(chunks, tag: csid)
+            }
+        }
         do {
             let result: RTMPResponse = try await withCheckedThrowingContinuation { continutation in
                 Task {
@@ -413,6 +430,9 @@ public actor RTMPConnection: HaishinKit.NetworkConnection {
                 await stream.deleteStream()
             }
         }
+        chunkOutContinuation?.finish()
+        chunkOutContinuation = nil
+        chunkOutTask = nil
         await socket?.close()
         await networkMonitor?.stopRunning()
 
@@ -436,9 +456,7 @@ public actor RTMPConnection: HaishinKit.NetworkConnection {
             logger.trace("<<", message)
         }
         let chunks = Array(outputBuffer.putMessage(type, chunkStreamId: chunkStreamId.rawValue, message: message))
-        Task {
-            await socket?.send(chunks)
-        }
+        chunkOutContinuation?.yield((chunks, chunkStreamId.rawValue))
         return message.payload.count
     }
 
