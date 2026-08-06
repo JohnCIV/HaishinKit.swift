@@ -35,15 +35,22 @@ public actor SRTConnection: NetworkConnection {
     private var listener: SRTSocket?
     private var networkMonitor: NetworkMonitor?
 
+    // libsrt is initialized once for the process lifetime. srt_cleanup() must never run
+    // mid-process: it pthread_joins libsrt's GC thread from whichever thread releases the
+    // last SRTConnection (the main thread in practice) and deadlocks against any in-flight
+    // connect/close (S39). The OS reclaims the library state at process exit.
+    private static let libsrtStartup: Void = {
+        srt_startup()
+    }()
+
     /// Creates an object.
     public init() {
-        srt_startup()
+        _ = Self.libsrtStartup
         socket = SRTSocket()
     }
 
     deinit {
         streams.removeAll()
-        srt_cleanup()
     }
 
     /// Gets a SRTSocketOption.
