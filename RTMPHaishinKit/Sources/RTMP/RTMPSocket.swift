@@ -23,6 +23,11 @@ public struct RTMPWireStats: Sendable {
     /// 800 ms IS a stall — no completion needed to know it. Consumers should
     /// treat max(rollingMaxSendDurMs, inFlightAgeMs) as the effective max.
     public let inFlightAgeMs: Double
+    /// S45: cumulative count of stale queued video frames dropped forward to
+    /// the next keyframe by the send-backlog freshness gate (connection-side),
+    /// and the media time they covered. 0 on a healthy link.
+    public let backlogDroppedFrames: Int
+    public let backlogDroppedMs: Double
 }
 
 final class RTMPWireStatsRegistry: @unchecked Sendable {
@@ -33,6 +38,8 @@ final class RTMPWireStatsRegistry: @unchecked Sendable {
         var queue: Int = 0
         var lastUpdate: TimeInterval = 0
         var inFlightSince: Double = 0   // CACurrentMediaTime of current send's start; 0 = idle
+        var backlogDroppedFrames: Int = 0
+        var backlogDroppedMs: Double = 0
     }
     private var perHost: [String: Window] = [:]
     private let maxSamples = 60   // ~0.75 s of video+audio messages on a 30 fps stream
@@ -63,6 +70,17 @@ final class RTMPWireStatsRegistry: @unchecked Sendable {
         lock.unlock()
     }
 
+    /// S45: called by the connection's freshness gate once per drop episode.
+    func recordBacklogDrop(host: String, frames: Int, droppedMs: Double) {
+        guard !host.isEmpty else { return }
+        lock.lock()
+        var w = perHost[host] ?? Window()
+        w.backlogDroppedFrames += frames
+        w.backlogDroppedMs += droppedMs
+        perHost[host] = w
+        lock.unlock()
+    }
+
     func snapshot(host: String) -> RTMPWireStats? {
         lock.lock()
         defer { lock.unlock() }
@@ -75,7 +93,9 @@ final class RTMPWireStatsRegistry: @unchecked Sendable {
                              rollingMaxSendDurMs: mx,
                              queueBytesOut: w.queue,
                              samples: w.samples.count,
-                             inFlightAgeMs: inFlightAge)
+                             inFlightAgeMs: inFlightAge,
+                             backlogDroppedFrames: w.backlogDroppedFrames,
+                             backlogDroppedMs: w.backlogDroppedMs)
     }
 
     func reset(host: String) {
@@ -110,23 +130,15 @@ final actor RTMPSocket {
             oldValue?.forceCancel()
         }
     }
-    // Each element is (bytes, chunkStreamId). The csid tag (0x04 audio, 0x05 video,
-    // 0 for handshake/untagged) flows into the egress CSV so wire interleave can be
-    // measured per media type.
-    private var outputs: AsyncStream<(Data, UInt16)>.Continuation? {
-        didSet {
-            oldValue?.finish()
-        }
-    }
     private var qualityOfService: DispatchQoS = .userInitiated
     private var continuation: CheckedContinuation<Void, any Swift.Error>?
     private lazy var networkQueue = DispatchQueue(label: "com.haishinkit.HaishinKit.RTMPSocket.network", qos: qualityOfService)
 
     // Wire-egress instrumentation (paired with RTMPSender's wirelog). Captures pre/post
     // wall time around each `connection.send(.contentProcessed)` so we can distinguish
-    // "encoder bursts into outputs stream" from "TCP send buffer back-pressures us".
+    // "encoder bursts into the send path" from "TCP send buffer back-pressures us".
     // Gated by the FLS app's `fls.streaming.wirelog.enabled` UserDefault — cached at
-    // connect time so the drain loop skips even the timestamp captures when disabled.
+    // connect time so the send path skips even the timestamp captures when disabled.
     private var egressEnabled = false
     private var egressHost: String = ""
     private var egressLastPostWall: Double = 0
@@ -210,40 +222,35 @@ final actor RTMPSocket {
         }
     }
 
-    func send(_ data: Data) {
+    // The send methods complete only after the kernel has processed the bytes
+    // (`connection.send(.contentProcessed)`), so a blocked TCP socket
+    // back-pressures the caller instead of piling messages into an invisible
+    // unbounded buffer here (S45: an 80 s uplink block queued ~2,400 frames
+    // that flushed at 13x real-time on release). The backlog now accumulates
+    // at the connection's outbound queue, where the freshness gate can drop
+    // stale video forward to a keyframe. Callers must be serial per socket —
+    // in practice: the handshake path, then RTMPConnection's single
+    // chunkOutTask — so wire order is preserved.
+    func send(_ data: Data) async {
         guard connected else {
             return
         }
         queueBytesOut += data.count
-        outputs?.yield((data, 0))
+        await performSend(data, tag: 0)
     }
 
-    // Concatenate all chunks from one RTMP message into a single Data and yield once.
-    // The downstream consumer awaits `connection.send(.contentProcessed)` per yielded
-    // Data; with 8KB chunkSize a single 33KB video message would otherwise produce 5
-    // sequential continuation round-trips. One large Data = one round-trip, eliminates
+    // Concatenate all chunks from one RTMP message into a single Data and send once.
+    // With 8KB chunkSize a single 33KB video message would otherwise produce 5
+    // sequential kernel round-trips. One large Data = one round-trip, eliminates
     // the ~120ms audio bunching that head-of-line-blocks behind video messages.
-    func send(_ iterator: AnyIterator<Data>, tag: UInt16 = 0) {
-        guard connected else {
-            return
-        }
-        var combined = Data()
-        for data in iterator {
-            combined.append(data)
-        }
-        guard !combined.isEmpty else { return }
-        queueBytesOut += combined.count
-        outputs?.yield((combined, tag))
-    }
-
-    func send(_ chunks: [Data], tag: UInt16 = 0) {
+    func send(_ chunks: [Data], tag: UInt16 = 0) async {
         guard connected else {
             return
         }
         guard !chunks.isEmpty else { return }
         if chunks.count == 1 {
             queueBytesOut += chunks[0].count
-            outputs?.yield((chunks[0], tag))
+            await performSend(chunks[0], tag: tag)
             return
         }
         var combined = Data()
@@ -251,7 +258,38 @@ final actor RTMPSocket {
             combined.append(data)
         }
         queueBytesOut += combined.count
-        outputs?.yield((combined, tag))
+        await performSend(combined, tag: tag)
+    }
+
+    // The tag is the chunkStreamId (0x04 audio, 0x05 video, 0 for
+    // handshake/untagged); it flows into the egress CSV so wire interleave can
+    // be measured per media type.
+    private func performSend(_ data: Data, tag: UInt16) async {
+        // Always-on: capture send-completion timing for the ABR controller.
+        // Two CACurrentMediaTime() calls + a registry update per RTMP message
+        // (~78/s for a 30 fps stream) — negligible cost, drives bitrate control.
+        // S35: mark the send start BEFORE awaiting so a blocked send is
+        // visible to snapshot() as a growing inFlightAgeMs while it hangs.
+        let preSend = CACurrentMediaTime()
+        RTMPWireStatsRegistry.shared.markSendStart(host: egressHost, at: preSend)
+        do {
+            try await transmit(data)
+        } catch {
+            // The NWConnection state/viability handlers own closing the socket;
+            // leave the accounting to the reconnect reset.
+            return
+        }
+        let postSend = CACurrentMediaTime()
+        let sendDurMs = (postSend - preSend) * 1000
+        let queueSnapshot = queueBytesOut
+        if egressEnabled {
+            recordEgress(preSend: preSend, postSend: postSend, byteCount: data.count, csid: tag)
+        }
+        RTMPWireStatsRegistry.shared.record(host: egressHost,
+                                            sendDurMs: sendDurMs,
+                                            queueBytesOut: queueSnapshot)
+        totalBytesOut += data.count
+        queueBytesOut -= data.count
     }
 
     func recv() -> AsyncStream<Data> {
@@ -279,7 +317,6 @@ final actor RTMPSocket {
             self.continuation = nil
         }
         connected = false
-        outputs = nil
         connection = nil
         continuation = nil
         try? egressLogHandle?.close()
@@ -326,31 +363,6 @@ final actor RTMPSocket {
         case .ready:
             logger.info("Connection is ready.")
             connected = true
-            let (stream, continuation) = AsyncStream<(Data, UInt16)>.makeStream()
-            Task {
-                for await (data, tag) in stream where connected {
-                    // Always-on: capture send-completion timing for the ABR controller.
-                    // Two CACurrentMediaTime() calls + a registry update per RTMP message
-                    // (~78/s for a 30 fps stream) — negligible cost, drives bitrate control.
-                    // S35: mark the send start BEFORE awaiting so a blocked send is
-                    // visible to snapshot() as a growing inFlightAgeMs while it hangs.
-                    let preSend = CACurrentMediaTime()
-                    RTMPWireStatsRegistry.shared.markSendStart(host: egressHost, at: preSend)
-                    try await send(data)
-                    let postSend = CACurrentMediaTime()
-                    let sendDurMs = (postSend - preSend) * 1000
-                    let queueSnapshot = queueBytesOut
-                    if egressEnabled {
-                        await recordEgress(preSend: preSend, postSend: postSend, byteCount: data.count, csid: tag)
-                    }
-                    RTMPWireStatsRegistry.shared.record(host: egressHost,
-                                                       sendDurMs: sendDurMs,
-                                                       queueBytesOut: queueSnapshot)
-                    totalBytesOut += data.count
-                    queueBytesOut -= data.count
-                }
-            }
-            self.outputs = continuation
             self.continuation?.resume()
             self.continuation = nil
         case .waiting(let error):
@@ -378,7 +390,7 @@ final actor RTMPSocket {
         }
     }
 
-    private func send(_ data: Data) async throws {
+    private func transmit(_ data: Data) async throws {
         return try await withCheckedThrowingContinuation { continuation in
             guard let connection else {
                 continuation.resume(throwing: Error.invalidState)

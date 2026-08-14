@@ -485,6 +485,22 @@ struct RTMPVideoMessage: RTMPMessage {
             payload[0] & 0b01110000 >> 4 == RTMPVideoCodec.avc.rawValue
     }
 
+    /// True for coded frames (AVC NAL / HEVC codedFrames), false for decoder
+    /// configuration and other non-frame packets. Used by the S45 freshness
+    /// gate: only coded frames may be dropped; config packets are required
+    /// receiver state.
+    var isCodedFrame: Bool {
+        return isExHeader ?
+            packetType == RTMPVideoPacketType.codedFrames.rawValue || packetType == RTMPVideoPacketType.codedFramesX.rawValue :
+            packetType == RTMPAVCPacketType.nal.rawValue
+    }
+
+    /// FLV frame type from the first payload byte; the same bit layout applies
+    /// to classic AVC and the exHeader (HEVC) form.
+    var isKeyFrame: Bool {
+        return (payload[0] >> 4) & 0b0111 == RTMPFrameType.key.rawValue
+    }
+
     var compositionTime: Int32 {
         let offset = self.offset
         var compositionTime = Int32(data: [0] + payload[2 + offset..<5 + offset]).bigEndian

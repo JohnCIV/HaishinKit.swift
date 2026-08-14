@@ -2,6 +2,7 @@ import AVFoundation
 import Combine
 import Foundation
 import HaishinKit
+import QuartzCore
 
 // MARK: -
 /// The RTMPConnection class create a two-way RTMP connection.
@@ -196,14 +197,30 @@ public actor RTMPConnection: HaishinKit.NetworkConnection {
     }
 
     private var socket: RTMPSocket?
+    // One outbound RTMP message queued by doOutput, awaiting serialization.
+    // Serialization is deferred to the consumer task so the S45 freshness gate
+    // can drop stale video BEFORE its chunk headers (delta timestamps) are
+    // baked — a dropped message never touches outputBuffer, so the receiver's
+    // per-chunk-stream timestamp chain stays consistent.
+    private struct OutboundMessage: Sendable {
+        let type: RTMPChunkType
+        let chunkStreamId: UInt16
+        let message: any RTMPMessage
+        let kind: RTMPOutboundKind
+        let enqueuedAt: Double   // CACurrentMediaTime at doOutput
+    }
+
     // FIFO forwarder from doOutput to the socket. doOutput previously spawned one
     // unstructured Task per message ("Task { await socket?.send(chunks) }"); Task
     // scheduling does not guarantee creation order, so audio/video messages could
     // reach the socket — and the wire — out of order under load. RTMP chunk
     // timestamps are delta-encoded per chunk stream, so wire reordering corrupts
     // receiver-side timing. Yielding into an AsyncStream from the actor preserves
-    // call order; the single consumer task forwards sequentially.
-    private var chunkOutContinuation: AsyncStream<([Data], UInt16)>.Continuation?
+    // call order; the single consumer task serializes and forwards sequentially.
+    // socket.send back-pressures (completes on kernel accept), so during an
+    // uplink block the backlog accumulates HERE as unserialized messages with
+    // enqueue timestamps — exactly what the freshness gate needs (S45).
+    private var chunkOutContinuation: AsyncStream<OutboundMessage>.Continuation?
     private var chunkOutTask: Task<Void, Never>?
     private var chunks: [UInt16: RTMPChunkMessageHeader] = [:]
     private var streams: [RTMPStream] = []
@@ -224,14 +241,11 @@ public actor RTMPConnection: HaishinKit.NetworkConnection {
             inputBuffer.chunkSize = chunkSizeC
         }
     }
-    private var chunkSizeS = RTMPChunkMessageHeader.chunkSize {
-        didSet {
-            guard chunkSizeS != oldValue else {
-                return
-            }
-            outputBuffer.chunkSize = chunkSizeS
-        }
-    }
+    // NOTE: outputBuffer.chunkSize is NOT updated here. Serialization is
+    // deferred to the chunkOut consumer task, so the new size must apply only
+    // after the queued RTMPSetChunkSizeMessage itself has been serialized —
+    // the consumer applies it at that point (see connect()).
+    private var chunkSizeS = RTMPChunkMessageHeader.chunkSize
     private var operations: [Int: CheckedContinuation<RTMPResponse, any Swift.Error>] = [:]
     private var inputBuffer = RTMPChunkBuffer()
     private var windowSizeC = RTMPConnection.defaultWindowSizeS {
@@ -335,6 +349,7 @@ public actor RTMPConnection: HaishinKit.NetworkConnection {
         readyState = .uninitialized
         chunkSizeC = RTMPChunkMessageHeader.chunkSize
         chunkSizeS = RTMPChunkMessageHeader.chunkSize
+        outputBuffer.chunkSize = chunkSizeS
         currentTransactionId = Self.connectTransactionId
         socket = RTMPSocket(qualityOfService: qualityOfService, securityLevel: secure ? .negotiatedSSL : .none)
         networkMonitor = await socket?.makeNetworkMonitor()
@@ -342,11 +357,40 @@ public actor RTMPConnection: HaishinKit.NetworkConnection {
             throw Error.invalidState
         }
         chunkOutContinuation?.finish()
-        let (chunkStream, chunkContinuation) = AsyncStream<([Data], UInt16)>.makeStream()
+        let (chunkStream, chunkContinuation) = AsyncStream<OutboundMessage>.makeStream()
         chunkOutContinuation = chunkContinuation
+        let statsHost = uri.host ?? ""
         chunkOutTask = Task {
-            for await (chunks, csid) in chunkStream {
-                await socket.send(chunks, tag: csid)
+            // S45 freshness gate: socket.send back-pressures, so after an
+            // uplink block this loop dequeues the whole backlog rapidly and
+            // the gate drops stale video forward to the next fresh keyframe
+            // instead of flushing it (audio/config/control always pass; see
+            // RTMPFreshnessGate for the full policy).
+            var gate = RTMPFreshnessGate()
+            for await outbound in chunkStream {
+                let ageMs = (CACurrentMediaTime() - outbound.enqueuedAt) * 1000
+                switch gate.verdict(kind: outbound.kind, chunkType: outbound.type, timestampMs: outbound.message.timestamp, ageMs: ageMs) {
+                case .drop:
+                    continue
+                case .send(let timestampShiftMs, let endedEpisode):
+                    if let episode = endedEpisode {
+                        RTMPWireStatsRegistry.shared.recordBacklogDrop(host: statsHost, frames: episode.droppedFrames, droppedMs: Double(episode.droppedMs))
+                        logger.info("S45 freshness gate: dropped \(episode.droppedFrames) stale video frames (\(episode.droppedMs) ms) forward to keyframe")
+                    }
+                    let chunks: [Data]
+                    if timestampShiftMs > 0 {
+                        let shifted = RTMPTimestampShiftedMessage(base: outbound.message, timestamp: outbound.message.timestamp &+ timestampShiftMs)
+                        chunks = Array(outputBuffer.putMessage(outbound.type, chunkStreamId: outbound.chunkStreamId, message: shifted))
+                    } else {
+                        chunks = Array(outputBuffer.putMessage(outbound.type, chunkStreamId: outbound.chunkStreamId, message: outbound.message))
+                    }
+                    await socket.send(chunks, tag: outbound.chunkStreamId)
+                    // Apply the announced server chunk size only after the
+                    // announcement itself is serialized (see chunkSizeS note).
+                    if let setChunkSize = outbound.message as? RTMPSetChunkSizeMessage {
+                        outputBuffer.chunkSize = Int(setChunkSize.size)
+                    }
+                }
             }
         }
         do {
@@ -455,8 +499,16 @@ public actor RTMPConnection: HaishinKit.NetworkConnection {
         if logger.isEnabledFor(level: .trace) {
             logger.trace("<<", message)
         }
-        let chunks = Array(outputBuffer.putMessage(type, chunkStreamId: chunkStreamId.rawValue, message: message))
-        chunkOutContinuation?.yield((chunks, chunkStreamId.rawValue))
+        let kind: RTMPOutboundKind
+        switch message {
+        case let video as RTMPVideoMessage:
+            kind = video.isCodedFrame ? .videoCoded(isKeyFrame: video.isKeyFrame) : .videoConfig
+        case is RTMPAudioMessage:
+            kind = .audio
+        default:
+            kind = .other
+        }
+        chunkOutContinuation?.yield(OutboundMessage(type: type, chunkStreamId: chunkStreamId.rawValue, message: message, kind: kind, enqueuedAt: CACurrentMediaTime()))
         return message.payload.count
     }
 
