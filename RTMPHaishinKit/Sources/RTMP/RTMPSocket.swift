@@ -231,40 +231,47 @@ final actor RTMPSocket {
     // stale video forward to a keyframe. Callers must be serial per socket —
     // in practice: the handshake path, then RTMPConnection's single
     // chunkOutTask — so wire order is preserved.
-    func send(_ data: Data) async {
+    //
+    // Returns false when nothing reached the kernel (socket closed or the
+    // send errored). The consumer uses this to skip drain pacing and drop
+    // accounting while finish-draining a dead connection's queue — the
+    // 2026-08-14 rig session showed a recycle's teardown drain pacing for
+    // seconds and polluting the wire-stats registry with phantom drops.
+    @discardableResult
+    func send(_ data: Data) async -> Bool {
         guard connected else {
-            return
+            return false
         }
         queueBytesOut += data.count
-        await performSend(data, tag: 0)
+        return await performSend(data, tag: 0)
     }
 
     // Concatenate all chunks from one RTMP message into a single Data and send once.
     // With 8KB chunkSize a single 33KB video message would otherwise produce 5
     // sequential kernel round-trips. One large Data = one round-trip, eliminates
     // the ~120ms audio bunching that head-of-line-blocks behind video messages.
-    func send(_ chunks: [Data], tag: UInt16 = 0) async {
+    @discardableResult
+    func send(_ chunks: [Data], tag: UInt16 = 0) async -> Bool {
         guard connected else {
-            return
+            return false
         }
-        guard !chunks.isEmpty else { return }
+        guard !chunks.isEmpty else { return false }
         if chunks.count == 1 {
             queueBytesOut += chunks[0].count
-            await performSend(chunks[0], tag: tag)
-            return
+            return await performSend(chunks[0], tag: tag)
         }
         var combined = Data()
         for data in chunks {
             combined.append(data)
         }
         queueBytesOut += combined.count
-        await performSend(combined, tag: tag)
+        return await performSend(combined, tag: tag)
     }
 
     // The tag is the chunkStreamId (0x04 audio, 0x05 video, 0 for
     // handshake/untagged); it flows into the egress CSV so wire interleave can
     // be measured per media type.
-    private func performSend(_ data: Data, tag: UInt16) async {
+    private func performSend(_ data: Data, tag: UInt16) async -> Bool {
         // Always-on: capture send-completion timing for the ABR controller.
         // Two CACurrentMediaTime() calls + a registry update per RTMP message
         // (~78/s for a 30 fps stream) — negligible cost, drives bitrate control.
@@ -277,7 +284,7 @@ final actor RTMPSocket {
         } catch {
             // The NWConnection state/viability handlers own closing the socket;
             // leave the accounting to the reconnect reset.
-            return
+            return false
         }
         let postSend = CACurrentMediaTime()
         let sendDurMs = (postSend - preSend) * 1000
@@ -290,6 +297,7 @@ final actor RTMPSocket {
                                             queueBytesOut: queueSnapshot)
         totalBytesOut += data.count
         queueBytesOut -= data.count
+        return true
     }
 
     func recv() -> AsyncStream<Data> {

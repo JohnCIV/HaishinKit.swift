@@ -386,10 +386,6 @@ public actor RTMPConnection: HaishinKit.NetworkConnection {
                 case .drop:
                     continue
                 case .send(let timestampShiftMs, let endedEpisode):
-                    if let episode = endedEpisode {
-                        RTMPWireStatsRegistry.shared.recordBacklogDrop(host: statsHost, frames: episode.droppedFrames, droppedMs: Double(episode.droppedMs))
-                        logger.info("S45 freshness gate: dropped \(episode.droppedFrames) stale video frames (\(episode.droppedMs) ms) forward to keyframe")
-                    }
                     let chunks: [Data]
                     if timestampShiftMs > 0 {
                         let shifted = RTMPTimestampShiftedMessage(base: outbound.message, timestamp: outbound.message.timestamp &+ timestampShiftMs)
@@ -398,7 +394,17 @@ public actor RTMPConnection: HaishinKit.NetworkConnection {
                         chunks = Array(outputBuffer.putMessage(outbound.type, chunkStreamId: outbound.chunkStreamId, message: outbound.message))
                     }
                     let sendStart = CACurrentMediaTime()
-                    await socket.send(chunks, tag: outbound.chunkStreamId)
+                    let sent = await socket.send(chunks, tag: outbound.chunkStreamId)
+                    // Drop episodes are recorded only when the resume keyframe
+                    // actually reached the kernel: while finish-draining a dead
+                    // connection's queue the "drops" are post-mortem noise —
+                    // the 2026-08-14 recycle polluted the host registry with
+                    // +7 s of phantom drops that the next segment's distress
+                    // machine announced as a fresh skip.
+                    if sent, let episode = endedEpisode {
+                        RTMPWireStatsRegistry.shared.recordBacklogDrop(host: statsHost, frames: episode.droppedFrames, droppedMs: Double(episode.droppedMs))
+                        logger.info("S45 freshness gate: dropped \(episode.droppedFrames) stale video frames (\(episode.droppedMs) ms) forward to keyframe")
+                    }
                     // S45 v2 paced drain: while meaningfully behind (a backlog
                     // is draining), each video frame of media delta d may leave
                     // no faster than d / drainRate of wall time — the drain
@@ -410,8 +416,9 @@ public actor RTMPConnection: HaishinKit.NetworkConnection {
                     // and the rest of the app never block on it. Below the
                     // floor the encoder's own cadence is the pacing; a
                     // sub-second flush is normal TCP jitter every packager
-                    // absorbs.
-                    if case .videoCoded = outbound.kind, ageMs > Self.drainPaceFloorMs {
+                    // absorbs. Never pace a dead socket: a teardown drain must
+                    // finish in milliseconds, not real-time.
+                    if sent, case .videoCoded = outbound.kind, ageMs > Self.drainPaceFloorMs {
                         let mediaDeltaMs = Double(outbound.message.timestamp)
                         let budgetMs = min(mediaDeltaMs / Self.drainRateMultiplier, Self.drainPaceMaxSleepMs)
                         let spentMs = (CACurrentMediaTime() - sendStart) * 1000
