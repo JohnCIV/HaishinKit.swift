@@ -222,6 +222,15 @@ public actor RTMPConnection: HaishinKit.NetworkConnection {
     // enqueue timestamps — exactly what the freshness gate needs (S45).
     private var chunkOutContinuation: AsyncStream<OutboundMessage>.Continuation?
     private var chunkOutTask: Task<Void, Never>?
+    // S45 v2 paced-drain tunables. Rate 1.33x: a stall of B seconds fully
+    // returns to live in ~3B while never bursting the packager (the original
+    // failure was an 80 s backlog flushing at 13x — YouTube discarded the
+    // tail). Floor 750 ms: below that the backlog flushes freely (normal
+    // jitter-sized). Max sleep clamps one frame's pace so no timestamp
+    // anomaly can wedge the consumer.
+    private static let drainRateMultiplier: Double = 1.33
+    private static let drainPaceFloorMs: Double = 750
+    private static let drainPaceMaxSleepMs: Double = 100
     private var chunks: [UInt16: RTMPChunkMessageHeader] = [:]
     private var streams: [RTMPStream] = []
     private var sequence: Int64 = 0
@@ -361,10 +370,14 @@ public actor RTMPConnection: HaishinKit.NetworkConnection {
         chunkOutContinuation = chunkContinuation
         let statsHost = uri.host ?? ""
         chunkOutTask = Task {
-            // S45 freshness gate: socket.send back-pressures, so after an
-            // uplink block this loop dequeues the whole backlog rapidly and
-            // the gate drops stale video forward to the next fresh keyframe
-            // instead of flushing it (audio/config/control always pass; see
+            // S45 freshness gate + paced drain: socket.send back-pressures, so
+            // after an uplink block this loop dequeues the backlog. Within the
+            // gate's latency budget everything is KEPT and drained at a capped
+            // rate (the stream runs temporarily behind live, then catches up —
+            // no content lost, and the remote packager never sees the 13x
+            // flush burst that made it discard the late tail). Only beyond the
+            // budget does the gate drop video forward to the next fresh
+            // keyframe (audio/config/control always pass; see
             // RTMPFreshnessGate for the full policy).
             var gate = RTMPFreshnessGate()
             for await outbound in chunkStream {
@@ -384,7 +397,29 @@ public actor RTMPConnection: HaishinKit.NetworkConnection {
                     } else {
                         chunks = Array(outputBuffer.putMessage(outbound.type, chunkStreamId: outbound.chunkStreamId, message: outbound.message))
                     }
+                    let sendStart = CACurrentMediaTime()
                     await socket.send(chunks, tag: outbound.chunkStreamId)
+                    // S45 v2 paced drain: while meaningfully behind (a backlog
+                    // is draining), each video frame of media delta d may leave
+                    // no faster than d / drainRate of wall time — the drain
+                    // runs at ~1.33x real-time instead of link speed. Paced by
+                    // the ORIGINAL delta (the carry shift on a resume keyframe
+                    // is a clock jump, not media to pace out) and clamped so a
+                    // malformed delta can never stall the pipeline. Sleeping
+                    // here only delays this consumer's next dequeue — appends
+                    // and the rest of the app never block on it. Below the
+                    // floor the encoder's own cadence is the pacing; a
+                    // sub-second flush is normal TCP jitter every packager
+                    // absorbs.
+                    if case .videoCoded = outbound.kind, ageMs > Self.drainPaceFloorMs {
+                        let mediaDeltaMs = Double(outbound.message.timestamp)
+                        let budgetMs = min(mediaDeltaMs / Self.drainRateMultiplier, Self.drainPaceMaxSleepMs)
+                        let spentMs = (CACurrentMediaTime() - sendStart) * 1000
+                        let sleepMs = budgetMs - spentMs
+                        if sleepMs >= 1 {
+                            try? await Task.sleep(nanoseconds: UInt64(sleepMs * 1_000_000))
+                        }
+                    }
                     // Apply the announced server chunk size only after the
                     // announcement itself is serialized (see chunkSizeS note).
                     if let setChunkSize = outbound.message as? RTMPSetChunkSizeMessage {

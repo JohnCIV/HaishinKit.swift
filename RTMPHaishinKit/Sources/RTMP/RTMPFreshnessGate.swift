@@ -34,9 +34,16 @@ enum RTMPOutboundKind: Sendable {
 /// the resume keyframe's delta, keeping the receiver's video clock
 /// wall-accurate: the picture jumps to live instead of falling behind audio.
 ///
-/// The threshold sits far above normal Starlink jitter (100–400 ms send
-/// spikes, ~15 s handover cadence) so a healthy link never drops anything —
-/// queue age only approaches it when the socket is genuinely blocked.
+/// S45 v2 (John's ruling 2026-08-14): the threshold is a LATENCY BUDGET, not
+/// a trigger we expect to hit. Stalls shorter than the budget lose NOTHING —
+/// the whole backlog is kept and the connection's consumer drains it at a
+/// rate-capped pace (see RTMPConnection), so the stream runs temporarily
+/// behind live and then catches up; the VOD stays complete. The gate is the
+/// backstop for stalls that outlive the budget (TCP kills the socket at
+/// ~40 s of blocked send anyway, so the budget only concedes what physics
+/// already forces). 12 s: comfortably above the 08-12 field day's ~9 s
+/// average stall cycle, comfortably below socket death, ~12 MB of queue at
+/// an 8 Mbps ceiling, and a bounded worst-case viewer delay.
 struct RTMPFreshnessGate {
     struct DropEpisode {
         let droppedFrames: Int
@@ -52,7 +59,7 @@ struct RTMPFreshnessGate {
         case drop
     }
 
-    static let defaultStaleThresholdMs: Double = 2500
+    static let defaultStaleThresholdMs: Double = 12_000
 
     let staleThresholdMs: Double
     private var droppingToKeyFrame = false
